@@ -4,7 +4,7 @@ import json
 import time
 import base64
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -18,21 +18,29 @@ load_dotenv()
 # CONFIGURATION
 # ==================================================
 
-URL = (
-    "https://in.bookmyshow.com/movies/hyderabad/"
-    "avengers-doomsday/buytickets/ET00526306/20261217"
-    "?etCodes=*&language=english&refEventCode=ET00526306"
+URL = os.getenv("BMS_URL", "").strip()
+
+THEATRE_NAMES = [
+    name.strip()
+    for name in os.getenv(
+        "THEATRE_NAMES",
+        "Prasads Multiplex,ALLU Cinemas: Kokapet"
+    ).split(",")
+    if name.strip()
+]
+
+PRASADS_NAME = next(
+    (name for name in THEATRE_NAMES if "prasads" in name.casefold()),
+    "Prasads Multiplex"
 )
+ALLU_NAME = next(
+    (name for name in THEATRE_NAMES if "allu" in name.casefold()),
+    "ALLU Cinemas: Kokapet"
+)
+ALLU_FORMAT = os.getenv("ALLU_FORMAT", "DOLBY CINEMA").strip().upper()
 
-PRASADS_NAME = "Prasads Multiplex"
-ALLU_NAME = "ALLU Cinemas: Kokapet"
-
-CHECK_INTERVAL = 60
+CHECK_INTERVAL = max(1, int(os.getenv("CHECK_INTERVAL", "60")))
 COOLDOWN_SECONDS = 300
-
-START_HOUR = 8
-END_HOUR = 23
-
 TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
@@ -75,32 +83,6 @@ def save_state(state):
     )
 
 
-# ==================================================
-# MONITORING HOURS
-# ==================================================
-
-def within_monitoring_hours():
-    now = datetime.now(TIMEZONE)
-    return START_HOUR <= now.hour < END_HOUR
-
-
-def seconds_until_start():
-    now = datetime.now(TIMEZONE)
-
-    next_start = now.replace(
-        hour=START_HOUR,
-        minute=0,
-        second=0,
-        microsecond=0
-    )
-
-    if now.hour >= END_HOUR:
-        next_start += timedelta(days=1)
-
-    return max(1, int((next_start - now).total_seconds()))
-
-
-# ==================================================
 # GREEN COLOUR DETECTION
 # ==================================================
 
@@ -138,51 +120,40 @@ def check_prasads(body):
 # ==================================================
 
 def check_allu_dolby(page):
-    """
-    Inspect Dolby Cinema showtime buttons belonging
-    to ALLU Cinemas: Kokapet only.
-
-    Laser 4K Atmos buttons are excluded because
-    their aria-label does not contain DOLBY CINEMA.
-    """
-
-    buttons = page.locator(
-        '[role="button"][aria-label*="DOLBY CINEMA" i]'
-    )
-
+    """Inspect the configured ALLU theatre and showtime format only."""
+    buttons = page.locator('[role="button"][aria-label]')
     results = []
 
     for index in range(buttons.count()):
         button = buttons.nth(index)
-
         result = button.evaluate(
             """
-            button => {
-                let element = button;
+            (button, config) => {
+                const label = button.getAttribute("aria-label") || "";
+                if (!label.toUpperCase().includes(config.format)) {
+                    return { found: false };
+                }
 
+                let element = button;
                 for (let i = 0; i < 12 && element; i++) {
                     const text = element.innerText || "";
-
                     if (
-                        text.includes("ALLU Cinemas: Kokapet") &&
-                        text.toUpperCase().includes("DOLBY CINEMA")
+                        text.toLowerCase().includes(config.theatreName.toLowerCase()) &&
+                        text.toUpperCase().includes(config.format)
                     ) {
                         return {
                             found: true,
-                            label: button.getAttribute("aria-label"),
-                            borderColor:
-                                getComputedStyle(button).borderColor
+                            label,
+                            borderColor: getComputedStyle(button).borderColor
                         };
                     }
-
                     element = element.parentElement;
                 }
-
                 return { found: false };
             }
-            """
+            """,
+            {"theatreName": ALLU_NAME, "format": ALLU_FORMAT}
         )
-
         if result.get("found"):
             results.append(result)
 
@@ -390,25 +361,24 @@ def main():
     print("AVENGERS: DOOMSDAY MONITOR")
     print("=" * 55)
 
-    print("\nMonitoring:")
-    print("  1. Prasads Multiplex - Theatre appearance")
-    print("  2. ALLU Cinemas - Dolby Cinema turns green")
-
-    print("\nCheck interval: 1 minute")
+    print("\nConfigured theatres:")
+    for theatre in THEATRE_NAMES:
+        print(f"  - {theatre}")
+    print(f"ALLU format: {ALLU_FORMAT}")
+    print(f"Check interval: {CHECK_INTERVAL} seconds")
     print("Browser: Restarted after every check")
-    print("Monitoring hours: 8 AM - 11 PM IST")
+    print("Monitoring: 24/7")
     print("Press CTRL+C to stop.")
+
+    if not URL:
+        raise RuntimeError("BMS_URL environment variable is missing.")
+    if not THEATRE_NAMES:
+        raise RuntimeError("THEATRE_NAMES environment variable is empty.")
 
     state = load_state()
 
     try:
         while True:
-
-            if not within_monitoring_hours():
-                wait = seconds_until_start()
-                print("\nOutside monitoring hours. Waiting until 8 AM.")
-                time.sleep(wait)
-                continue
 
             try:
                 with sync_playwright() as p:
