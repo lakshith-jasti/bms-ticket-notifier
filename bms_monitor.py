@@ -3,7 +3,6 @@ import os
 import json
 import time
 import base64
-import re
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -18,29 +17,18 @@ load_dotenv()
 # CONFIGURATION
 # ==================================================
 
-URL = os.getenv("BMS_URL", "").strip()
-
-THEATRE_NAMES = [
-    name.strip()
-    for name in os.getenv(
-        "THEATRE_NAMES",
-        "Prasads Multiplex,ALLU Cinemas: Kokapet"
-    ).split(",")
-    if name.strip()
-]
-
-PRASADS_NAME = next(
-    (name for name in THEATRE_NAMES if "prasads" in name.casefold()),
-    "Prasads Multiplex"
+URL = (
+    "https://in.bookmyshow.com/movies/hyderabad/"
+    "avengers-doomsday/buytickets/ET00526306/20261217"
+    "?etCodes=*&language=english&refEventCode=ET00526306"
 )
-ALLU_NAME = next(
-    (name for name in THEATRE_NAMES if "allu" in name.casefold()),
-    "ALLU Cinemas: Kokapet"
-)
-ALLU_FORMAT = os.getenv("ALLU_FORMAT", "DOLBY CINEMA").strip().upper()
 
-CHECK_INTERVAL = max(1, int(os.getenv("CHECK_INTERVAL", "60")))
+PRASADS_NAME = "Prasads Multiplex"
+ALLU_NAME = "ALLU Cinemas: Kokapet"
+
+CHECK_INTERVAL = 60
 COOLDOWN_SECONDS = 300
+
 TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
@@ -55,7 +43,7 @@ SCREENSHOT_DIR = Path("alerts")
 
 
 # ==================================================
-# STATE
+# STATE MANAGEMENT
 # ==================================================
 
 def load_state():
@@ -65,14 +53,14 @@ def load_state():
         )
 
         state.setdefault("prasads_alerted", False)
-        state.setdefault("allu_green_alerted", False)
+        state.setdefault("allu_dolby_alerted", False)
 
         return state
 
     except (FileNotFoundError, json.JSONDecodeError):
         return {
             "prasads_alerted": False,
-            "allu_green_alerted": False
+            "allu_dolby_alerted": False
         }
 
 
@@ -80,30 +68,6 @@ def save_state(state):
     STATE_FILE.write_text(
         json.dumps(state, indent=2),
         encoding="utf-8"
-    )
-
-
-# GREEN COLOUR DETECTION
-# ==================================================
-
-def is_green(border_color):
-    if not border_color:
-        return False
-
-    match = re.search(
-        r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)",
-        border_color
-    )
-
-    if not match:
-        return False
-
-    red, green, blue = map(int, match.groups())
-
-    return (
-        green >= 100
-        and green > red * 1.15
-        and green > blue * 1.15
     )
 
 
@@ -120,40 +84,52 @@ def check_prasads(body):
 # ==================================================
 
 def check_allu_dolby(page):
-    """Inspect the configured ALLU theatre and showtime format only."""
-    buttons = page.locator('[role="button"][aria-label]')
+    """
+    Detect Dolby Cinema showtime buttons belonging
+    to ALLU Cinemas: Kokapet.
+
+    Colour and availability are ignored.
+    Laser 4K Atmos is not included.
+    """
+
+    buttons = page.locator(
+        '[role="button"][aria-label*="DOLBY CINEMA" i]'
+    )
+
     results = []
 
     for index in range(buttons.count()):
         button = buttons.nth(index)
+
         result = button.evaluate(
             """
-            (button, config) => {
-                const label = button.getAttribute("aria-label") || "";
-                if (!label.toUpperCase().includes(config.format)) {
-                    return { found: false };
-                }
-
+            (button, theatreName) => {
                 let element = button;
+
                 for (let i = 0; i < 12 && element; i++) {
                     const text = element.innerText || "";
+
                     if (
-                        text.toLowerCase().includes(config.theatreName.toLowerCase()) &&
-                        text.toUpperCase().includes(config.format)
+                        text.toLowerCase().includes(
+                            theatreName.toLowerCase()
+                        ) &&
+                        text.toUpperCase().includes("DOLBY CINEMA")
                     ) {
                         return {
                             found: true,
-                            label,
-                            borderColor: getComputedStyle(button).borderColor
+                            label: button.getAttribute("aria-label")
                         };
                     }
+
                     element = element.parentElement;
                 }
+
                 return { found: false };
             }
             """,
-            {"theatreName": ALLU_NAME, "format": ALLU_FORMAT}
+            ALLU_NAME
         )
+
         if result.get("found"):
             results.append(result)
 
@@ -161,7 +137,7 @@ def check_allu_dolby(page):
 
 
 # ==================================================
-# EMAIL
+# EMAIL NOTIFICATION
 # ==================================================
 
 def send_email(alert_messages, screenshot_path):
@@ -221,7 +197,7 @@ def send_email(alert_messages, screenshot_path):
 
 
 # ==================================================
-# MAIN CHECK
+# BOOKMYSHOW CHECK
 # ==================================================
 
 def check_bookmyshow(page, state):
@@ -259,60 +235,50 @@ def check_bookmyshow(page, state):
     alerts = []
 
     # ----------------------------------------------
-    # 1. PRASADS
+    # 1. PRASADS THEATRE APPEARANCE
     # ----------------------------------------------
 
     prasads_found = check_prasads(body)
 
     if prasads_found:
+
         print("  Prasads Multiplex: FOUND")
 
         if not state["prasads_alerted"]:
             alerts.append(
                 "Prasads Multiplex has appeared on BookMyShow."
             )
-    else:
-        print("  Prasads Multiplex: Not listed")
 
+    else:
+
+        print("  Prasads Multiplex: Not listed")
         state["prasads_alerted"] = False
 
     # ----------------------------------------------
-    # 2. ALLU DOLBY CINEMA
+    # 2. ALLU DOLBY CINEMA APPEARANCE
     # ----------------------------------------------
 
     dolby_results = check_allu_dolby(page)
 
-    allu_green = False
+    if dolby_results:
 
-    if not dolby_results:
-        print("  ALLU Dolby Cinema showtimes: Not found")
-
-    else:
         for show in dolby_results:
-            color = show["borderColor"]
-            green = is_green(color)
-
             print(
-                f"  ALLU {show['label']} | "
-                f"Border: {color}"
+                f"  ALLU Dolby Cinema detected: "
+                f"{show['label']}"
             )
 
-            if green:
-                allu_green = True
+        if not state["allu_dolby_alerted"]:
+            alerts.append(
+                "ALLU Cinemas: Kokapet - "
+                "A Dolby Cinema showtime has appeared "
+                "on BookMyShow."
+            )
 
-        if allu_green:
-            print("  ALLU Dolby Cinema: GREEN")
-        else:
-            print("  ALLU Dolby Cinema: NOT GREEN")
+    else:
 
-    if allu_green and not state["allu_green_alerted"]:
-        alerts.append(
-            "ALLU Cinemas: Kokapet - "
-            "A Dolby Cinema showtime has turned GREEN!"
-        )
-
-    if dolby_results and not allu_green:
-        state["allu_green_alerted"] = False
+        print("  ALLU Dolby Cinema showtimes: Not found")
+        state["allu_dolby_alerted"] = False
 
     # ----------------------------------------------
     # 3. EMAIL NEW ALERTS
@@ -342,8 +308,8 @@ def check_bookmyshow(page, state):
             if prasads_found:
                 state["prasads_alerted"] = True
 
-            if allu_green:
-                state["allu_green_alerted"] = True
+            if dolby_results:
+                state["allu_dolby_alerted"] = True
 
     save_state(state)
 
@@ -351,9 +317,8 @@ def check_bookmyshow(page, state):
 
 
 # ==================================================
-# MAIN
+# MAIN MONITORING LOOP - 24/7
 # ==================================================
-
 
 def main():
 
@@ -361,31 +326,32 @@ def main():
     print("AVENGERS: DOOMSDAY MONITOR")
     print("=" * 55)
 
-    print("\nConfigured theatres:")
-    for theatre in THEATRE_NAMES:
-        print(f"  - {theatre}")
-    print(f"ALLU format: {ALLU_FORMAT}")
-    print(f"Check interval: {CHECK_INTERVAL} seconds")
-    print("Browser: Restarted after every check")
-    print("Monitoring: 24/7")
-    print("Press CTRL+C to stop.")
+    print("\nMonitoring:")
+    print("  1. Prasads Multiplex - Theatre appearance")
+    print("  2. ALLU Cinemas: Kokapet - Dolby Cinema appearance")
 
-    if not URL:
-        raise RuntimeError("BMS_URL environment variable is missing.")
-    if not THEATRE_NAMES:
-        raise RuntimeError("THEATRE_NAMES environment variable is empty.")
+    print("\nMonitoring:")
+    print("  1. Prasads Multiplex - Theatre appearance")
+    print("  2. ALLU Cinemas: Kokapet - Dolby Cinema showtime")
+    print("\nCheck interval: 60 seconds")
+    print("Monitoring: 24/7")
 
     state = load_state()
 
     try:
+
         while True:
 
             try:
+
                 with sync_playwright() as p:
 
-                    browser = p.chromium.launch(headless=False)
+                    browser = p.chromium.launch(
+                        headless=False
+                    )
 
                     try:
+
                         page = browser.new_page(
                             viewport={
                                 "width": 1440,
@@ -398,25 +364,35 @@ def main():
                         )
 
                     finally:
+
                         browser.close()
                         print("  Browser closed.")
 
                 if access_error:
-                    print("  Access error. Cooling down for 30 minutes.")
+
+                    print(
+                        "  Access error. "
+                        "Cooling down for 5 minutes."
+                    )
+
                     time.sleep(COOLDOWN_SECONDS)
                     continue
 
             except Exception as error:
+
                 print(f"  Check failed: {error}")
-                print("  Cooling down for 30 minutes.")
+                print("  Cooling down for 5 minutes.")
+
                 time.sleep(COOLDOWN_SECONDS)
                 continue
 
-            print("Next check in 1 minute.")
+            print("Next check in 60 seconds.")
             time.sleep(CHECK_INTERVAL)
 
     except KeyboardInterrupt:
+
         print("\nMonitor stopped.")
+
 
 if __name__ == "__main__":
     main()
